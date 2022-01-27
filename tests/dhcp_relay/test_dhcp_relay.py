@@ -460,3 +460,35 @@ def test_dhcp_relay_random_sport(ptfhost, dut_dhcp_relay_data, validate_dut_rout
                            "testbed_mode": testbed_mode,
                            "testing_mode": testing_mode},
                    log_file="/tmp/dhcp_relay_test.DHCPTest.log")
+
+def test_dhcp_relay_storm(ptfhost, dut_dhcp_relay_data, validate_dut_routes_exist, testing_config, toggle_all_simulator_ports_to_rand_selected_tor_m):
+    """CoPP test proved that we only lift x mount of packet for DHCP into CPU port. 
+       However, during CoPP test, the upper layer services are shutdown to prevent packet count contaminations. 
+       This test is to make sure that the DHCP relay service can survive the max load that we lift to CPU.
+       Preconditions:
+        1. SONiC has no CoPP policy on DHCP.
+        2. SONiC will spawn one DHCP relay agent per Vlan interface (Why? The spawned processes may 
+           increase the PPS performance of DHCP relay agent in some level)
+        3. This test is intended to check the performance of DHCP relay service,  but the effectiveness is limited
+           by the performance of ptf (PPS limitation of ptf), will take it as a pass if reach the limit of the ptf or 
+           a satisfied number (platform specific?)
+        4. Which kind of DHCP pkts for the storm tests? All four types, DORA. To start 4 threads, each one hold one type.
+           at least 5 ip helpers (48) per vlan interface. uplink one to 48, downlink one to one. 
+        5. Speed and duration?
+            Speed incremental to the max, and hold on max for at least 120 seconds. (If the performance of DHCP relay is lower than 
+            ptf, the performance should be different on each platform due to CPU difference)
+        6. Dual ToR
+            TBD, 
+        7. Multi ASICS
+            TBD
+        8. IPv6, separate test case for IPv4 and IPv6
+    """
+    testing_mode, duthost, testbed_mode = testing_config
+
+    if testing_mode == DUAL_TOR_MODE:
+        skip_release(duthost, ["201811", "201911"])
+
+    ptf_runner(ptfhost, "ptftests", "dhcp_relay_test.DHCPStormTest", platform_dir="ptftests", 
+               params={"hostname": duthost.hostname, "dut_dhcp_relay_data": dut_dhcp_relay_data},
+               log_file="/tmp/dhcp_relay_test.DHCPTest.log")
+
