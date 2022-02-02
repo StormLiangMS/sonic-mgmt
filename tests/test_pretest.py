@@ -12,7 +12,7 @@ from tests.common.helpers.assertions import pytest_assert
 from tests.common.helpers.assertions import pytest_require
 from tests.common.dualtor.constants import UPPER_TOR, LOWER_TOR
 from tests.common.helpers.dut_utils import verify_features_state
-from tests.common.utilities import wait_until
+from tests.common.utilities import wait_untilf
 from tests.common.reboot import reboot
 from tests.common.platform.processes_utils import wait_critical_processes
 from tests.common.utilities import get_host_visible_vars

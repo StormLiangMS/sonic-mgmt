@@ -9,7 +9,11 @@ import ptf.testutils as testutils
 from ptf import config
 from ptf.base_tests import BaseTest
 from ptf.mask import Mask
-
+from queue import Queue
+import threading
+import datetime
+from tests.common.utilities import wait_until
+import time
 
 # Helper function to increment an IP address
 # ip_addr should be passed as a dot-decimal string
@@ -585,14 +589,26 @@ class DHCPStormTest(DataplaneBaseTest):
     DHCP_STORM_PPS_MAX = 700
     DHCP_STORM_PPS_MIN = 100
     DHCP_STORM_PPS_STEPS = 200
-
+    DEFAULT_SEND_INTERVAL_SEC = 10
+    mask_option = {'Ether': scapy.Ether, 'IP':scapy.IP, 'UDP':scapy.UDP, 'BOOTP':scapy.BOOTP}
+    q = Queue()
+    
     def __init__(self):
         DataplaneBaseTest.__init__(self)
+        self.thread_helper = {}
 
+    def log(self, message, debug=False):
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if (debug and self.verbose) or (not debug):
+            print("%s : %s" % (current_time, message))
+        self.log_fp.write("%s : %s\n" % (current_time, message))
 
     def setUp(self):
         DataplaneBaseTest.setUp(self)
-
+        self.log_fp = open('/tmp/dhcp.log', 'a')
+        test_params = testutils.test_params_get()
+        self.verbose = 'verbose' in test_params and test_params['verbose']
+        
         self.test_params = testutils.test_params_get()
 
         self.hostname = self.test_params['hostname']
@@ -730,370 +746,112 @@ class DHCPStormTest(DataplaneBaseTest):
         pkt = ether / ip / udp / bootp
         return pkt
 
-    def create_dhcp_offer_packet(self):
-        return testutils.dhcp_offer_packet(eth_server=self.server_iface_mac,
-                    eth_dst=self.uplink_mac,
-                    eth_client=self.client_mac,
-                    ip_server=self.server_ip,
-                    ip_dst=self.relay_iface_ip if not self.dual_tor else self.switch_loopback_ip,
-                    ip_offered=self.client_ip,
-                    port_dst=self.DHCP_SERVER_PORT,
-                    ip_gateway=self.relay_iface_ip if not self.dual_tor else self.switch_loopback_ip,
-                    netmask_client=self.client_subnet,
-                    dhcp_lease=self.LEASE_TIME,
-                    padding_bytes=0,
-                    set_broadcast_bit=True)
-
-    def create_dhcp_offer_relayed_packet(self):
-        my_chaddr = ''.join([chr(int(octet, 16)) for octet in self.client_mac.split(':')])
-
-        # Relay modifies the DHCPOFFER message in the following ways:
-        #  1.) Replaces the source MAC with the MAC of the interface it received it on
-        #  2.) Replaces the destination MAC with boradcast (ff:ff:ff:ff:ff:ff)
-        #  3.) Replaces the source IP with the IP of the interface which the relay
-        #      received it on
-        #  4.) Replaces the destination IP with broadcast (255.255.255.255)
-        #  5.) Replaces the destination port with the DHCP client port (68)
-        ether = scapy.Ether(dst=self.BROADCAST_MAC, src=self.relay_iface_mac, type=0x0800)
-        ip = scapy.IP(src=self.relay_iface_ip, dst=self.BROADCAST_IP, len=290, ttl=64)
-        udp = scapy.UDP(sport=self.DHCP_SERVER_PORT, dport=self.DHCP_CLIENT_PORT, len=262)
-        bootp = scapy.BOOTP(op=2,
-                    htype=1,
-                    hlen=6,
-                    hops=0,
-                    xid=0,
-                    secs=0,
-                    flags=0x8000,
-                    ciaddr=self.DEFAULT_ROUTE_IP,
-                    yiaddr=self.client_ip,
-                    siaddr=self.server_ip,
-                    giaddr=self.relay_iface_ip if not self.dual_tor else self.switch_loopback_ip,
-                    chaddr=my_chaddr)
-        bootp /= scapy.DHCP(options=[('message-type', 'offer'),
-                    ('server_id', self.server_ip),
-                    ('lease_time', self.LEASE_TIME),
-                    ('subnet_mask', self.client_subnet),
-                    ('end')])
-
-        # TODO: Need to add this to the packet creation functions in PTF code first!
-        # If our bootp layer is too small, pad it
-        #pad_bytes = self.DHCP_PKT_BOOTP_MIN_LEN - len(bootp)
-        #if pad_bytes > 0:
-        #    bootp /= scapy.PADDING('\x00' * pad_bytes)
-
-        pkt = ether / ip / udp / bootp
-        return pkt
-
-    def create_dhcp_request_packet(self, dst_mac=BROADCAST_MAC, src_port=DHCP_CLIENT_PORT):
-        request_packet = testutils.dhcp_request_packet(
-            eth_client=self.client_mac,
-            ip_server=self.server_ip,
-            ip_requested=self.client_ip,
-            set_broadcast_bit=True
-        )
-
-        request_packet[scapy.Ether].dst = dst_mac
-        request_packet[scapy.IP].sport = src_port
-
-        if dst_mac != self.BROADCAST_MAC:
-            request_packet[scapy.IP].dst = self.switch_loopback_ip
-            request_packet[scapy.IP].src = self.client_ip
-
-        return request_packet
-
-    def create_dhcp_request_relayed_packet(self):
-        my_chaddr = ''.join([chr(int(octet, 16)) for octet in self.client_mac.split(':')])
-
-        # Here, the actual destination MAC should be the MAC of the leaf the relay
-        # forwards through and the destination IP should be the IP of the DHCP server
-        # the relay is forwarding to. We don't need to confirm these, so we'll
-        # just mask them off later
-        #
-        # TODO: In IP layer, DHCP relay also replaces source IP with IP of interface on
-        #       which it received the broadcast DHCPREQUEST from client. This appears to
-        #       be loopback. We could pull from minigraph and check here.
-        ether = scapy.Ether(dst=self.BROADCAST_MAC, src=self.uplink_mac, type=0x0800)
-        ip = scapy.IP(src=self.DEFAULT_ROUTE_IP, dst=self.BROADCAST_IP, len=336, ttl=64)
-        udp = scapy.UDP(sport=self.DHCP_SERVER_PORT, dport=self.DHCP_SERVER_PORT, len=316)
-        bootp = scapy.BOOTP(op=1,
-                    htype=1,
-                    hlen=6,
-                    hops=1,
-                    xid=0,
-                    secs=0,
-                    flags=0x8000,
-                    ciaddr=self.DEFAULT_ROUTE_IP,
-                    yiaddr=self.DEFAULT_ROUTE_IP,
-                    siaddr=self.DEFAULT_ROUTE_IP,
-                    giaddr=self.relay_iface_ip if not self.dual_tor else self.switch_loopback_ip,
-                    chaddr=my_chaddr)
-        bootp /= scapy.DHCP(options=[('message-type', 'request'),
-                    ('requested_addr', self.client_ip),
-                    ('server_id', self.server_ip),
-                    ('relay_agent_Information', self.option82),
-                    ('end')])
-
-        # If our bootp layer is too small, pad it
-        pad_bytes = self.DHCP_PKT_BOOTP_MIN_LEN - len(bootp)
-        if pad_bytes > 0:
-            bootp /= scapy.PADDING('\x00' * pad_bytes)
-
-        pkt = ether / ip / udp / bootp
-        return pkt
-
-    def create_dhcp_ack_packet(self):
-        return testutils.dhcp_ack_packet(eth_server=self.server_iface_mac,
-                    eth_dst=self.uplink_mac,
-                    eth_client=self.client_mac,
-                    ip_server=self.server_ip,
-                    ip_dst=self.relay_iface_ip if not self.dual_tor else self.switch_loopback_ip,
-                    ip_offered=self.client_ip,
-                    port_dst=self.DHCP_SERVER_PORT,
-                    ip_gateway=self.relay_iface_ip if not self.dual_tor else self.switch_loopback_ip,
-                    netmask_client=self.client_subnet,
-                    dhcp_lease=self.LEASE_TIME,
-                    padding_bytes=0,
-                    set_broadcast_bit=True)
-
-    def create_dhcp_ack_relayed_packet(self):
-        my_chaddr = ''.join([chr(int(octet, 16)) for octet in self.client_mac.split(':')])
-
-        # Relay modifies the DHCPACK message in the following ways:
-        #  1.) Replaces the source MAC with the MAC of the interface it received it on
-        #  2.) Replaces the destination MAC with boradcast (ff:ff:ff:ff:ff:ff)
-        #  3.) Replaces the source IP with the IP of the interface which the relay
-        #      received it on
-        #  4.) Replaces the destination IP with broadcast (255.255.255.255)
-        #  5.) Replaces the destination port with the DHCP client port (68)
-        ether = scapy.Ether(dst=self.BROADCAST_MAC, src=self.relay_iface_mac, type=0x0800)
-        ip = scapy.IP(src=self.relay_iface_ip, dst=self.BROADCAST_IP, len=290, ttl=64)
-        udp = scapy.UDP(sport=self.DHCP_SERVER_PORT, dport=self.DHCP_CLIENT_PORT, len=262)
-        bootp = scapy.BOOTP(op=2,
-                    htype=1,
-                    hlen=6,
-                    hops=0,
-                    xid=0,
-                    secs=0,
-                    flags=0x8000,
-                    ciaddr=self.DEFAULT_ROUTE_IP,
-                    yiaddr=self.client_ip,
-                    siaddr=self.server_ip,
-                    giaddr=self.relay_iface_ip if not self.dual_tor else self.switch_loopback_ip,
-                    chaddr=my_chaddr)
-        bootp /= scapy.DHCP(options=[('message-type', 'ack'),
-                    ('server_id', self.server_ip),
-                    ('lease_time', self.LEASE_TIME),
-                    ('subnet_mask', self.client_subnet),
-                    ('end')])
-
-        # TODO: Need to add this to the packet creation functions in PTF code first!
-        # If our bootp layer is too small, pad it
-        #pad_bytes = self.DHCP_PKT_BOOTP_MIN_LEN - len(bootp)
-        #if pad_bytes > 0:
-        #    bootp /= scapy.PADDING('\x00' * pad_bytes)
-
-        pkt = ether / ip / udp / bootp
-        return pkt
-
-
-
-    """
-     Send/receive functions
-
-    """
-
-    # Simulate client coming on VLAN and broadcasting a DHCPDISCOVER message
-    def client_send_discover(self, dst_mac=BROADCAST_MAC, src_port=DHCP_CLIENT_PORT):
-        # Form and send DHCPDISCOVER packet
+    def dhcp_storm_send(self):
+        # dhcp pkts build
         dhcp_discover = self.create_dhcp_discover_packet(dst_mac, src_port)
-        testutils.send_packet(self, self.client_port_index, dhcp_discover)
+        
+        # send pkts in PPS for some time (inputs: pkt, PPS, time)
+        end_time = datetime.datetime.now() + datetime.timedelta(seconds=self.DEFAULT_SEND_INTERVAL_SEC)
 
-    # Verify that the DHCP relay actually received and relayed the DHCPDISCOVER message to all of
-    # its known DHCP servers. We also verify that the relay inserted Option 82 information in the
-    # packet.
-    def verify_relayed_discover(self):
+        send_count = 0
+        while datetime.datetime.now() < end_time:
+            testutils.send_packet(self, self.client_port_index, dhcp_discover)
+            send_count += 1
+
+            # Depending on the server/platform combination it is possible for the server to
+            # overwhelm the DUT, so we add an artificial delay here to rate-limit the server.
+            time.sleep(1.0 / float(self.cur_pps))
+
+    def mask_off(self, masks, masked_discover):
+        for item in masks:
+            for mask in self.mask_option[item]:
+                masked_discover.set_do_not_care_scapy(item, mask)
+
+    def dhcp_storm_recv(self):
+        # recieve pkts and validate 
+        # record the time and recieved pkts number
         # Create a packet resembling a relayed DCHPDISCOVER packet
+        
+        # 2 conditions to stop recieve, recieve a singal to main thread or timeout
         dhcp_discover_relayed = self.create_dhcp_discover_relayed_packet()
 
         # Mask off fields we don't care about matching
         masked_discover = Mask(dhcp_discover_relayed)
-        masked_discover.set_do_not_care_scapy(scapy.Ether, "dst")
+            
+        mask_items = {}
+        mask_items['Ether'] = ['dst']
+        mask_items['IP'] = ['version', 'ihl', 'tos', 'len', 'id', 'flags', 'frag', 'ttl', 'proto', 'chksum', 'src', 'dst', 'options']
+        mask_items['UDP'] = ['chksum', 'len']
+        mask_items['BOOTP'] = ['sname', 'file']
 
-        masked_discover.set_do_not_care_scapy(scapy.IP, "version")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "ihl")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "tos")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "len")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "id")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "flags")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "frag")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "ttl")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "proto")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "chksum")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "src")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "dst")
-        masked_discover.set_do_not_care_scapy(scapy.IP, "options")
+        self.mask_off(mask_items, masked_discover)
+    
+        # send pkts in PPS for some time (inputs: pkt, PPS, time)
+        end_time = datetime.datetime.now() + datetime.timedelta(seconds=self.DEFAULT_SEND_INTERVAL_SEC)
 
-        masked_discover.set_do_not_care_scapy(scapy.UDP, "chksum")
-        masked_discover.set_do_not_care_scapy(scapy.UDP, "len")
-
-        masked_discover.set_do_not_care_scapy(scapy.BOOTP, "sname")
-        masked_discover.set_do_not_care_scapy(scapy.BOOTP, "file")
-
-        # Count the number of these packets received on the ports connected to our leaves
-        num_expected_packets = self.num_dhcp_servers
-        discover_count = testutils.count_matched_packets_all_ports(self, masked_discover, self.server_port_indices)
-        self.assertTrue(discover_count == num_expected_packets,
-                "Failed: Discover count of %d != %d" % (discover_count, num_expected_packets))
-
-    # Simulate a DHCP server sending a DHCPOFFER message to client.
-    # We do this by injecting a DHCPOFFER message on the link connected to one
-    # of our leaf switches.
-    def server_send_offer(self):
-        dhcp_offer = self.create_dhcp_offer_packet()
-        testutils.send_packet(self, self.server_port_indices[0], dhcp_offer)
-
-    # Verify that the DHCPOFFER would be received by our simulated client
-    def verify_offer_received(self):
-        dhcp_offer = self.create_dhcp_offer_relayed_packet()
-
-        masked_offer = Mask(dhcp_offer)
-
-        masked_offer.set_do_not_care_scapy(scapy.IP, "version")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "ihl")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "tos")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "len")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "id")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "flags")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "frag")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "ttl")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "proto")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "chksum")
-        masked_offer.set_do_not_care_scapy(scapy.IP, "options")
-
-        masked_offer.set_do_not_care_scapy(scapy.UDP, "len")
-        masked_offer.set_do_not_care_scapy(scapy.UDP, "chksum")
-
-        masked_offer.set_do_not_care_scapy(scapy.BOOTP, "sname")
-        masked_offer.set_do_not_care_scapy(scapy.BOOTP, "file")
-
-        masked_offer.set_do_not_care_scapy(scapy.DHCP, "lease_time")
-
-        #masked_offer.set_do_not_care_scapy(scapy.PADDING, "load")
-
-        # NOTE: verify_packet() will fail for us via an assert, so no need to check a return value here
-        testutils.verify_packet(self, masked_offer, self.client_port_index)
-
-    # Simulate our client sending a DHCPREQUEST message
-    def client_send_request(self, dst_mac=BROADCAST_MAC, src_port=DHCP_CLIENT_PORT):
-        dhcp_request = self.create_dhcp_request_packet(dst_mac, src_port)
-        testutils.send_packet(self, self.client_port_index, dhcp_request)
-
-    # Verify that the DHCP relay actually received and relayed the DHCPREQUEST message to all of
-    # its known DHCP servers. We also verify that the relay inserted Option 82 information in the
-    # packet.
-    def verify_relayed_request(self):
-        # Create a packet resembling a relayed DCHPREQUEST packet
-        dhcp_request_relayed = self.create_dhcp_request_relayed_packet()
-
-        # Mask off fields we don't care about matching
-        masked_request = Mask(dhcp_request_relayed)
-        masked_request.set_do_not_care_scapy(scapy.Ether, "dst")
-
-        masked_request.set_do_not_care_scapy(scapy.IP, "version")
-        masked_request.set_do_not_care_scapy(scapy.IP, "ihl")
-        masked_request.set_do_not_care_scapy(scapy.IP, "tos")
-        masked_request.set_do_not_care_scapy(scapy.IP, "len")
-        masked_request.set_do_not_care_scapy(scapy.IP, "id")
-        masked_request.set_do_not_care_scapy(scapy.IP, "flags")
-        masked_request.set_do_not_care_scapy(scapy.IP, "frag")
-        masked_request.set_do_not_care_scapy(scapy.IP, "ttl")
-        masked_request.set_do_not_care_scapy(scapy.IP, "proto")
-        masked_request.set_do_not_care_scapy(scapy.IP, "chksum")
-        masked_request.set_do_not_care_scapy(scapy.IP, "src")
-        masked_request.set_do_not_care_scapy(scapy.IP, "dst")
-        masked_request.set_do_not_care_scapy(scapy.IP, "options")
-
-        masked_request.set_do_not_care_scapy(scapy.UDP, "chksum")
-        masked_request.set_do_not_care_scapy(scapy.UDP, "len")
-
-        masked_request.set_do_not_care_scapy(scapy.BOOTP, "sname")
-        masked_request.set_do_not_care_scapy(scapy.BOOTP, "file")
-
-        # Count the number of these packets received on the ports connected to our leaves
-        num_expected_packets = self.num_dhcp_servers
-        request_count = testutils.count_matched_packets_all_ports(self, masked_request, self.server_port_indices)
-        self.assertTrue(request_count == num_expected_packets,
-                "Failed: Request count of %d != %d" % (request_count, num_expected_packets))
-
-    # Simulate a DHCP server sending a DHCPOFFER message to client from one of our leaves
-    def server_send_ack(self):
-        dhcp_ack = self.create_dhcp_ack_packet()
-        testutils.send_packet(self, self.server_port_indices[0], dhcp_ack)
-
-    # Verify that the DHCPACK would be received by our simulated client
-    def verify_ack_received(self):
-        dhcp_ack = self.create_dhcp_ack_relayed_packet()
-
-        masked_ack = Mask(dhcp_ack)
-
-        masked_ack.set_do_not_care_scapy(scapy.IP, "version")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "ihl")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "tos")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "len")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "id")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "flags")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "frag")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "ttl")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "proto")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "chksum")
-        masked_ack.set_do_not_care_scapy(scapy.IP, "options")
-
-        masked_ack.set_do_not_care_scapy(scapy.UDP, "len")
-        masked_ack.set_do_not_care_scapy(scapy.UDP, "chksum")
-
-        masked_ack.set_do_not_care_scapy(scapy.BOOTP, "sname")
-        masked_ack.set_do_not_care_scapy(scapy.BOOTP, "file")
-
-        masked_ack.set_do_not_care_scapy(scapy.DHCP, "lease_time")
-
-        # NOTE: verify_packet() will fail for us via an assert, so no need to check a return value here
-        testutils.verify_packet(self, masked_ack, self.client_port_index)
-
-    def dhcp_storm_send():
-        # dhcp pkts build
-        
-        # send pkts in pps setting for some time period
-        pass
-        
-    def dhcp_storm_recv():
-        # recieve pkts and validate 
-        # record the time and recieved pkts number
-        pass
+        recieve_count = 0
+        while datetime.datetime.now() < end_time:
+            recieve_count += testutils.count_matched_packets_all_ports(self, masked_discover, self.server_port_indices)
+            time.sleep((1.0 / float(self.cur_pps)) * 10)
+            if not self.q.empty():
+                data = self.q.get()
+                if data == "stop":
+                    break
+        recieve_pps = recieve_count / self.DEFAULT_SEND_INTERVAL_SEC
+        return recieve_pps
         
     def dhcp_health_check():
         # check dhcp relay agent status
+        # if the docker container is still running. 
+        # if the process is still running.
+        # if the dhcp can response request in time.
+        # If HDCP is not healthy, drop an exception and do the clean
+        
+        pass
+
+    def stress_test_start(self):
+        # Kick off the threads.
+        for thr in self.thread_helper:
+            thr.start()
+
+    def stress_test_stop(self):
+        # Stop criterions:
+        # 1. finish the testing as expected, finish the send and recieve, 
+        #        and get the signal from both threads
+        # 2. timeout. 
+        # Wai working threads
+        # Notify the recieve threads to stop
+        self.q.put("stop")
+        for thr in self.thread_helper:
+            thr.join()
+            
+    def result_parse():
+        # Several things to check. 
+        # 1. recieve PPS
+        # 2. send PPS
+        # 3. DHCP health result. 
+        # 4. Validate the pass criterion.
         pass
     
-    def result_triage():
-        pass
-    
-    def dhcp_stress_test():
+    def dhcp_stress_test(self):
         # Need 2 helper threads, one is for send, the other is for the recieve, run in parallel. 
-        thread_helper = {}
-        thread_helper['send_thr'] = Threading.thread(target = self.dhcp_storm_send)
-        thread_helper['recv_thr'] = Threading.thread(target = self.dhcp_storm_recv)
+        self.thread_helper['send_thr'] = threading.Thread(target = self.dhcp_storm_send)
+        self.thread_helper['recv_thr'] = threading.Thread(target = self.dhcp_storm_recv)
         
         # Start threads for sending and recieving
+        self.stress_test_start()
         
         # To check the health of DHCP relay agent in main thread.
-        self.dhcp_health_check()
+        wait_until(self.DEFAULT_SEND_INTERVAL_SEC * 2, self.DEFAULT_SEND_INTERVAL_SEC / 4, 0, 
+                   self.dhcp_health_check())
         
+        self.stress_test_stop()
         # Put all test results together and check
-        self.result_triage()
+        self.result_parse()
 
     def runTest(self):
         # PPS, start from 100 to MAX
-        self.ptf_pps = DHCP_STORM_PPS_MIN
-        while ptf_pps <= DHCP_STORM_PPS_MAX:
+        self.ptf_pps = self.DHCP_STORM_PPS_MIN
+        while self.ptf_pps <= self.DHCP_STORM_PPS_MAX:
             self.dhcp_stress_test()
-            ptf_pps += DHCP_STORM_PPS_STEPS
+            self.ptf_pps += self.sDHCP_STORM_PPS_STEPS
