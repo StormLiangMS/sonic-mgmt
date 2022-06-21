@@ -70,6 +70,7 @@ NEXTHOP_PREFIX = 100
 COMMUNITY_ID = "1234:1235"
 COMMUNITY_ID_UPDATED = "1234:1236"
 PROFILE_COMMUNITY = "FROM_SDN_SLB_ROUTES"
+BGP_TUNNEL_ROUTE_SCALE = 5000
 
 pytestmark = [
     # This script supports any T1 topology: t1, t1-64-lag, t1-lag.
@@ -423,7 +424,7 @@ def create_single_route(vnet, dest, mask, nhs, op, profile = None):
     }}'''.format(vnet, dest, mask, ",".join(nhs), 
     "" if profile is None else ",\n            \"profile\": \"{}\"".format(profile), op)
 
-def create_tunnel_profile(profile, community_id):
+def create_tunnel_profile(profile, community_id, op):
     '''
         Create a tunnel profile, op:SET/DEL
     '''
@@ -432,7 +433,7 @@ def create_tunnel_profile(profile, community_id):
             "community_id": "{}"
         }},
         "OP": "{}"
-    }}'''.format(profile, community_id)
+    }}'''.format(profile, community_id, op)
 
 Address_Count = 0
 def get_ip_address(af, hostid=1, netid=100):
@@ -1211,40 +1212,52 @@ class Test_VxLAN_underlay_ecmp(Test_VxLAN):
             raise
 
 class Test_VxLAN_overlay_route_bgp_adv(Test_VxLAN):
-    def setup_route_bgp_adv(self, encap_type, community_id, community_id_updated = None):
-        if self.setup[encap_type].get('route_adv_dest', None):
-            return
+    def delete_route_bgp_adv(self, encap_type, community_id = None):
+        logger.info("Pick a vnet for testing.")
+        vnet = self.setup[encap_type]['vnet_vni_map'].keys()[0]
+        config_list = []
+        tunnel_profile_name = None
+        if community_id is not None:
+            tunnel_profile_name = PROFILE_COMMUNITY
+        for k, v in self.route_info.items:
+            config_list.append(create_single_route(vnet, k, HOST_MASK[get_payload_version(encap_type)], [v], "DEL", profile=tunnel_profile_name))
+        
+        if community_id is not None:
+            config_list.append(create_tunnel_profile(tunnel_profile_name, community_id, 'DEL'))
+        full_config = '[' + "\n,".join(config_list) + '\n]'
 
+        apply_config_in_swss(self.setup['duthost'], full_config, "delete_route_bgp_adv"+encap_type)
+
+    def setup_route_bgp_adv(self, encap_type, routes_num, community_id = None, community_id_updated = None):
         logger.info("Pick a vnet for testing.")
         vnet = self.setup[encap_type]['vnet_vni_map'].keys()[0]
 
         logger.info("Create a new route and associated with a new NH.")
-        new_dest = get_ip_address(af=get_outer_layer_version(encap_type), netid=DESTINATION_PREFIX)
-        new_nh = get_ip_address(af=get_outer_layer_version(encap_type), netid=NEXTHOP_PREFIX)
-
-        logger.info("Using destinations: dest:{} => nh:{}".format(new_dest, new_nh))
-
-        logger.info("Map the destination and new endpoint.")
 
         config_list = []
         tunnel_profile_name = None
         if community_id is not None:
             tunnel_profile_name = PROFILE_COMMUNITY
-            config_list.append(create_tunnel_profile(tunnel_profile_name, community_id))
-        
-        config_list.append(create_single_route(vnet, new_dest, HOST_MASK[get_payload_version(encap_type)], [new_nh], "SET", profile=tunnel_profile_name))
-        self.setup[encap_type]['dest_to_nh_map'][vnet][new_dest] = [new_nh]
+            config_list.append(create_tunnel_profile(tunnel_profile_name, community_id, "SET"))
+
+        new_dest = []
+        new_nh = []
+        self.route_info = {}
+        for _ in routes_num:
+            new_dest.append(get_ip_address(af=get_outer_layer_version(encap_type), netid=DESTINATION_PREFIX))
+            new_nh = get_ip_address(af=get_outer_layer_version(encap_type), netid=NEXTHOP_PREFIX)
+            config_list.append(create_single_route(vnet, new_dest, HOST_MASK[get_payload_version(encap_type)], [new_nh], "SET", profile=tunnel_profile_name))
+            self.route_info[new_dest] = new_nh
+
         if community_id_updated is not None:
             config_list.append(create_tunnel_profile(tunnel_profile_name, community_id_updated))
 
         full_config = '[' + "\n,".join(config_list) + '\n]'
 
         logger.info("Apply the new config in the DUT and run traffic test.")
-        apply_config_in_swss(self.setup['duthost'], full_config, "setup_route_bgp_adv"+encap_type)
+        apply_config_in_swss(self.setup['duthost'], full_config, "setup_route_bgp_adv_scale"+encap_type)
 
         self.setup[encap_type]['route_adv_dest'] = new_dest
-
-        return
 
     def get_route_adv(self):
         """ Get bgp prefix config
@@ -1268,62 +1281,89 @@ class Test_VxLAN_overlay_route_bgp_adv(Test_VxLAN):
         )
         return output['stdout']
 
-    @pytest.mark.parametrize("community_id", [None, COMMUNITY_ID])
-    def test_vxlan_route_adv(self, setUp, minigraph_facts, enum_asic_index, encap_type, community_id):
-        self.setup_route_bgp_adv(encap_type, community_id)
-        # check local table and network information.
-        # check bgp facts include the network with or without profile
-        # check route-map
+    def check_bgp_route_adv(self, enum_asic_index, community_id, expect_exist):
+        # check network in BGP running configuration
         bgp_configured = False
         bgp_advertised = False
+        route_dests = self.route_info.keys
         bgp_adv_facts = self.get_route_adv()
-        for bgp_adv_route in bgp_adv_facts:
-            if (self.setup[encap_type]['route_adv_dest'] in bgp_adv_route and community_id in bgp_adv_route):
-                bgp_configured = True
-        pytest_assert(bgp_configured, "Tunnel routes is not added into running BGP configuration.")
+        if set(route_dests).issubset(set(bgp_adv_facts)):
+            bgp_configured = True
+        pytest_assert(bgp_configured if expect_exist else not bgp_configured, "Tunnel routes is not added into running BGP configuration.")
 
+        # check advertised route per BGP neighbor
         bgp_facts = self.setUp['duthost'].bgp_facts(instance_id=enum_asic_index)['ansible_facts']
         namespace = self.setUp['duthost'].get_namespace_from_asic_id(enum_asic_index)
 
         for k, v in bgp_facts['bgp_neighbors'].items():
             if v['state'] == 'established':
                 bgp_route_adv_facts = self.setUp['duthost'].bgp_route(neighbor=k, direction="adv",namespace_id=namespace)['ansible_facts']
-                for bgp_route_adv in bgp_route_adv_facts:
-                    if self.setup[encap_type]['route_adv_dest'] in bgp_route_adv:
-                        bgp_advertised = True
-            pytest_assert(bgp_advertised, "Tunnel routes is not advertised to neighbor {}.".format(k))
+                if set(route_dests).issubset(set(bgp_route_adv_facts)):
+                    bgp_advertised = True
+            pytest_assert(bgp_advertised if expect_exist else not bgp_advertised, "Tunnel routes is not advertised to neighbor {}.".format(k))
+            bgp_advertised = False
 
+        # check community string
         if community_id is not None:
-            pytest_assert(self.setup[encap_type]['route_adv_dest'] in self.get_bgp_community(community_id), "Tunnel routes is not advertised to neighbor with community id {}".format(community_id))
+            route_in_commutity = self.get_bgp_community(community_id)
+            pytest_assert(set(route_dests).issubset(set(route_in_commutity)) if expect_exist else len(set(route_dests).intersection(set(route_in_commutity))) == 0, 
+                          "Tunnel routes is not advertised to neighbor with community id {}".format(community_id))
+
+    @pytest.mark.parametrize("community_id", [None, COMMUNITY_ID])
+    def test_vxlan_route_adv(self, setUp, enum_asic_index, encap_type, community_id):
+        self.setup = setUp
+        try:
+            self.setup_route_bgp_adv(encap_type, 1, community_id)
+            # check local table and network information.
+            # check bgp facts include the network with or without profile
+            # check route-map
+            self.check_bgp_route_adv(enum_asic_index, encap_type, community_id, True)
+        finally:
+            # delete installed route
+            self.delete_route_bgp_adv(encap_type, community_id)
 
     def test_vxlan_update_community_id(self, setUp, minigraph_facts, enum_asic_index, encap_type):
-        self.setup_route_bgp_adv(encap_type, COMMUNITY_ID, COMMUNITY_ID_UPDATED)
+        self.setup = setUp
+        self.setup_route_bgp_adv(encap_type, 1, COMMUNITY_ID, COMMUNITY_ID_UPDATED)
         pytest_assert(self.setup[encap_type]['route_adv_dest'] in self.get_bgp_community(COMMUNITY_ID_UPDATED), "Tunnel routes is not updated with community id {}".format(COMMUNITY_ID_UPDATED))
 
-    def test_vxlan_postpone_add_community_id(self, setUp, minigraph_facts, encap_type):
-        self.setup_route_bgp_adv(encap_type)
-        # check local table and network information.
-        route info
-        # check the advertised routes for the neighbor device
-        parse_bgp_route_adv_json
+        self.delete_route_bgp_adv(encap_type, COMMUNITY_ID_UPDATED)
 
-    def test_vxlan_route_deletion(self, setUp, minigraph_facts, encap_type):
-        self.setup_route_bgp_adv(encap_type)
-        # check local table and network information.
-        route info
-        # check the advertised routes for the neighbor device
-        parse_bgp_route_adv_json
+    def test_vxlan_postpone_add_community_id(self, setUp, minigraph_facts, encap_type, enum_asic_index):
+        self.setup = setUp
+        try:
+            self.setup_route_bgp_adv(encap_type, 1)
+            # check local table and network information.
+            self.check_bgp_route_adv(enum_asic_index, encap_type, None, True)
+    
+            config_list = []
+            config_list.append(create_tunnel_profile(PROFILE_COMMUNITY, COMMUNITY_ID, "SET"))
+            pytest_assert(self.setup[encap_type]['route_adv_dest'] in self.get_bgp_community(COMMUNITY_ID), "Tunnel routes is not advertised to neighbor with community id {}".format(COMMUNITY_ID))
+        finally:
+            # delete installed route
+            self.delete_route_bgp_adv(encap_type, COMMUNITY_ID)
 
-    def test_vxlan_route_adv_scale(self, setUp, minigraph_facts, encap_type):
-        self.setup_route_bgp_adv(encap_type, community_id)
-        # check local table and network information.
-        route info
-        # check the advertised routes for the neighbor device
-        parse_bgp_route_adv_json
+    def test_vxlan_route_deletion(self, setUp, minigraph_facts, encap_type, enum_asic_index):
+        self.setup = setUp
+        try:
+            self.setup_route_bgp_adv(encap_type, 1, COMMUNITY_ID)
+            # check existence
+            self.check_bgp_route_adv(enum_asic_index, encap_type, COMMUNITY_ID, True)
 
-    def test_vxlan_route_adv_update_scale(self, setUp, minigraph_facts, encap_type):
-        self.setup_route_bgp_adv(encap_type, community_id)
-        # check local table and network information.
-        route info
-        # check the advertised routes for the neighbor device
-        parse_bgp_route_adv_json
+            # delete route
+            self.delete_route_bgp_adv(encap_type, COMMUNITY_ID)
+
+            # check existence
+            self.check_bgp_route_adv(enum_asic_index, encap_type, COMMUNITY_ID, False)
+        finally:
+            self.delete_route_bgp_adv(encap_type, COMMUNITY_ID)
+
+    @pytest.mark.parametrize("community_id_update", [None, COMMUNITY_ID_UPDATED])
+    def test_vxlan_route_adv_scale(self, setUp, enum_asic_index, encap_type, community_id_update):
+        try:
+            self.setup = setUp
+            self.setup_route_bgp_adv(encap_type, BGP_TUNNEL_ROUTE_SCALE, COMMUNITY_ID, community_id_update)
+            # check local table and network information.
+            self.check_bgp_route_adv(enum_asic_index, community_id_update if community_id_update else COMMUNITY_ID, True)
+        finally:
+            self.delete_route_bgp_adv(encap_type, community_id_update if community_id_update else COMMUNITY_ID)
