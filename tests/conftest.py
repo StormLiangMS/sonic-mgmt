@@ -9,6 +9,7 @@ import re
 import pytest
 import yaml
 import jinja2
+import copy
 
 from datetime import datetime
 from ipaddress import ip_interface, IPv4Interface
@@ -841,14 +842,22 @@ def swapSyncd(request, duthosts, rand_one_dut_hostname, creds):
     """
     duthost = duthosts[rand_one_dut_hostname]
     swapSyncd = request.config.getoption("--qos_swap_syncd")
+
+    # To check if docker registry from cli option
+    dock_reg_host = ""
     try:
         if swapSyncd:
-            docker.swap_syncd(duthost, creds)
+            new_creds = copy.deepcopy(creds)
+            new_creds['docker_registry_host'] = dock_reg_host
+            new_creds['docker_registry_username'] = ''
+            new_creds['docker_registry_password'] = ''
+
+            docker.swap_syncd(duthost, new_creds)
 
         yield
     finally:
         if swapSyncd:
-            docker.restore_default_syncd(duthost, creds)
+            docker.restore_default_syncd(duthost, new_creds)
 
 def get_host_data(request, dut):
     '''
