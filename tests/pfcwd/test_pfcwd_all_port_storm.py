@@ -240,6 +240,12 @@ class TestPfcwdAllPortStorm(object):
             # longer time to generate storm on all ports
             if tbinfo and tbinfo['topo']['type'] in ["lt2", "ft2"]:
                 timeout = 120
+            # Increase timeout for high-port-count platforms (e.g., 7260 with
+            # 108+ ports) where storm generation/restoration takes longer
+            num_ports = len(selected_test_ports)
+            if num_ports > 64:
+                timeout = max(timeout, 120)
+            logger.info(f"Using timeout {timeout}s for {num_ports} ports")
             pytest_assert(
                 wait_until(timeout, 2, 5, verify_all_ports_pfc_storm_in_expected_state, duthost,
                            storm_hndle, action, selected_test_ports, baseline_counters, threshold,
