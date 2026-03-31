@@ -21,6 +21,21 @@ user = {{ tacacs_rw_user }} {
     member = netadmin
 }
 
+{% if duthost_admin_user is defined %}
+user = {{ duthost_admin_user }} {
+    login = des {{ duthost_admin_passwd }}
+    member = netadmin
+}
+{% endif %}
+
+
+{% if duthost_ssh_user is defined %}
+user = {{ duthost_ssh_user }} {
+    login = des {{ duthost_ssh_passwd }}
+    member = netadmin
+}
+{% endif %}
+
 group = netuser {
     default service = permit
     service = exec {
@@ -56,7 +71,7 @@ user = {{ tacacs_authorization_user }} {
         deny   -exec
         permit .*
     }
-    cmd = /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 {
+    cmd = /lib/arch-linux-abi/ld-linux-arch.so {
         deny .*
     }
     cmd = /usr/bin/dash {

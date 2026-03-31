@@ -15,7 +15,7 @@ Description:
   -n
        Do not refresh DUT
   -t testbed_file
-       testbed file (default: vtestbed.csv)
+       testbed file (default: vtestbed.yaml)
   -T test_suite
        test suite [t0|t1-lag] (default: t0)
   tbname
@@ -30,8 +30,8 @@ Example:
 EOF
 }
 
-inventory="veos_vtb"
-testbed_file="vtestbed.csv"
+inventory="../ansible/veos_vtb"
+testbed_file="vtestbed.yaml"
 refresh_dut=true
 exit_on_error=""
 SONIC_MGMT_DIR=/data/sonic-mgmt
@@ -88,7 +88,12 @@ RUNTEST_CLI_COMMON_OPTS="\
 -q 1 \
 -a False \
 -O \
--r"
+-r \
+-e --allow_recover \
+-e --completeness_level=confident"
+
+# the following option is for multi-asic testing pipeline, to not fail on 1st test failure
+MULTI_ASIC_CLI_OPTIONS=`echo $RUNTEST_CLI_COMMON_OPTS | sed 's/-q 1//g'`
 
 if [ -n "$exit_on_error" ]; then
     RUNTEST_CLI_COMMON_OPTS="$RUNTEST_CLI_COMMON_OPTS -E"
@@ -100,64 +105,87 @@ test_t0() {
     tgname=1vlan
     if [ x$section == x"part-1" ]; then
       tests="\
-      monit/test_monit_status.py \
-      platform_tests/test_advanced_reboot.py::test_warm_reboot \
-      test_interfaces.py \
-      arp/test_arp_dualtor.py \
+      arp/test_arp_extended.py \
+      arp/test_neighbor_mac.py \
+      arp/test_neighbor_mac_noptf.py\
       bgp/test_bgp_fact.py \
       bgp/test_bgp_gr_helper.py::test_bgp_gr_helper_routes_perserved \
       bgp/test_bgp_speaker.py \
-      bgp/test_bgp_slb.py \
+      bgp/test_bgpmon.py \
       bgp/test_bgp_update_timer.py \
-      cacl/test_ebtables_application.py \
+      bmp/test_bmp_configdb.py \
+      bmp/test_bmp_redis_instance.py \
+      bmp/test_bmp_statedb.py \
+      bmp/test_docker_restart.py \
+      container_checker/test_container_checker.py \
       cacl/test_cacl_application.py \
       cacl/test_cacl_function.py \
       dhcp_relay/test_dhcp_relay.py \
       dhcp_relay/test_dhcpv6_relay.py \
+      iface_namingmode/test_iface_namingmode.py \
       lldp/test_lldp.py \
+      monit/test_monit_status.py \
       ntp/test_ntp.py \
       pc/test_po_cleanup.py \
       pc/test_po_update.py \
+      platform_tests/test_advanced_reboot.py::test_warm_reboot \
+      platform_tests/test_cpu_memory_usage.py \
       route/test_default_route.py \
       route/test_static_route.py \
-      arp/test_neighbor_mac.py \
-      arp/test_neighbor_mac_noptf.py\
       snmp/test_snmp_cpu.py \
+      snmp/test_snmp_default_route.py \
       snmp/test_snmp_interfaces.py \
       snmp/test_snmp_lldp.py \
+      snmp/test_snmp_loopback.py \
       snmp/test_snmp_pfc_counters.py \
       snmp/test_snmp_queue.py \
-      snmp/test_snmp_loopback.py \
-      snmp/test_snmp_default_route.py"
+      ssh/test_ssh_ciphers.py \
+      ssh/test_ssh_limit.py \
+      syslog/test_syslog.py\
+      tacacs/test_accounting.py \
+      tacacs/test_authorization.py \
+      tacacs/test_jit_user.py \
+      tacacs/test_ro_disk.py \
+      tacacs/test_ro_user.py \
+      tacacs/test_rw_user.py \
+      telemetry/test_telemetry.py \
+      test_features.py \
+      test_interfaces.py \
+      test_procdockerstatsd.py"
 
       pushd $SONIC_MGMT_DIR/tests
       ./run_tests.sh $RUNTEST_CLI_COMMON_OPTS -c "$tests" -p logs/$tgname
       popd
     else
       tests="\
-      ssh/test_ssh_stress.py \
-      ssh/test_ssh_ciphers.py \
-      syslog/test_syslog.py\
-      tacacs/test_rw_user.py \
-      tacacs/test_ro_user.py \
-      tacacs/test_ro_disk.py \
-      tacacs/test_jit_user.py \
-      tacacs/test_authorization.py \
-      tacacs/test_accounting.py \
-      telemetry/test_telemetry.py \
-      test_features.py \
-      test_procdockerstatsd.py \
-      iface_namingmode/test_iface_namingmode.py \
-      platform_tests/test_cpu_memory_usage.py \
-      bgp/test_bgpmon.py \
-      container_checker/test_container_checker.py \
-      process_monitoring/test_critical_process_monitoring.py \
-      system_health/test_system_status.py \
+      dns/test_dns_resolv_conf.py \
+      generic_config_updater/test_aaa.py \
+      generic_config_updater/test_bgpl.py \
+      generic_config_updater/test_bgp_prefix.py \
+      generic_config_updater/test_bgp_speaker.py \
       generic_config_updater/test_cacl.py \
+      generic_config_updater/test_dhcp_relay.py \
+      generic_config_updater/test_eth_interface.py \
+      generic_config_updater/test_ipv6.py \
       generic_config_updater/test_lo_interface.py \
-      generic_config_updater/test_vlan_interface.py \
+      generic_config_updater/test_monitor_config.py \
+      generic_config_updater/test_ntp.py \
       generic_config_updater/test_portchannel_interface.py \
-      show_techsupport/test_techsupport_no_secret.py"
+      generic_config_updater/test_syslog.py \
+      generic_config_updater/test_vlan_interface.py \
+      gnmi/test_gnmi.py \
+      gnmi/test_gnmi_configdb.py \
+      gnmi/test_gnmi_appldb.py \
+      gnmi/test_gnmi_countersdb.py \
+      gnmi_e2e/test_gnmi_auth.py \
+      override_config_table/test_override_config_table.py \
+      process_monitoring/test_critical_process_monitoring.py \
+      show_techsupport/test_techsupport_no_secret.py \
+      system_health/test_system_status.py \
+      radv/test_radv_ipv6_ra.py \
+      database/test_db_config.py \
+      database/test_db_scripts.py \
+      fips/test_fips.py"
 
       pushd $SONIC_MGMT_DIR/tests
       ./run_tests.sh $RUNTEST_CLI_COMMON_OPTS -c "$tests" -p logs/$tgname
@@ -183,13 +211,15 @@ test_t0() {
 }
 
 test_t0_sonic() {
-    # Run tests_1vlan on vlab-01 virtual switch
     # TODO: Use a marker to select these tests rather than providing a hard-coded list here.
     tgname=t0-sonic
-    tests="bgp/test_bgp_fact.py"
+    tests="\
+      bgp/test_bgp_fact.py \
+      pc/test_retry_count.py \
+      macsec"
 
     pushd $SONIC_MGMT_DIR/tests
-    ./run_tests.sh $RUNTEST_CLI_COMMON_OPTS -c "$tests" -p logs/$tgname -e "--neighbor_type=sonic"
+    ./run_tests.sh $RUNTEST_CLI_COMMON_OPTS -c "$tests" -p logs/$tgname -e "--neighbor_type=sonic --enable_macsec --macsec_profile=128_SCI,256_XPN_SCI"
     popd
 }
 
@@ -201,6 +231,13 @@ test_t2() {
 
     tgname=t2
     tests="\
+    bmp/test_bmp_configdb.py \
+    bmp/test_bmp_redis_instance.py \
+    bmp/test_bmp_statedb.py \
+    bmp/test_docker_restart.py \
+    gnmi/test_gnmi.py \
+    gnmi/test_gnmi_appldb.py \
+    gnmi/test_gnmi_countersdb.py \
     voq/test_voq_init.py"
 
     pushd $SONIC_MGMT_DIR/tests
@@ -211,25 +248,34 @@ test_t2() {
 test_t1_lag() {
     tgname=t1_lag
     tests="\
-    monit/test_monit_status.py \
-    test_interfaces.py \
-    bgp/test_bgp_fact.py \
     bgp/test_bgp_allow_list.py \
-    bgp/test_bgp_multipath_relax.py \
     bgp/test_bgp_bbr.py \
     bgp/test_bgp_bounce.py \
+    bgp/test_bgp_fact.py \
+    bgp/test_bgp_multipath_relax.py \
     bgp/test_bgp_update_timer.py \
+    bgp/test_bgpmon.py \
     bgp/test_traffic_shift.py \
+    bmp/test_bmp_configdb.py \
+    bmp/test_bmp_redis_instance.py \
+    bmp/test_bmp_statedb.py \
+    bmp/test_docker_restart.py \
+    configlet/test_add_rack.py \
+    container_checker/test_container_checker.py \
+    gnmi/test_gnmi.py \
+    gnmi/test_gnmi_configdb.py \
+    gnmi/test_gnmi_appldb.py \
+    gnmi/test_gnmi_countersdb.py \
     http/test_http_copy.py \
     ipfwd/test_mtu.py \
     lldp/test_lldp.py \
-    route/test_default_route.py \
+    monit/test_monit_status.py \
+    pc/test_lag_2.py \
     platform_tests/test_cpu_memory_usage.py \
-    bgp/test_bgpmon.py \
-    container_checker/test_container_checker.py \
     process_monitoring/test_critical_process_monitoring.py \
+    route/test_default_route.py \
     scp/test_scp_copy.py \
-    pc/test_lag_2.py"
+    test_interfaces.py"
 
     pushd $SONIC_MGMT_DIR/tests
     ./run_tests.sh $RUNTEST_CLI_COMMON_OPTS -c "$tests" -p logs/$tgname
@@ -240,20 +286,75 @@ test_multi_asic_t1_lag() {
     tgname=multi_asic_t1_lag
     tests="\
     bgp/test_bgp_fact.py \
+    bmp/test_bmp_configdb.py \
+    bmp/test_bmp_redis_instance.py \
+    bmp/test_bmp_statedb.py \
+    bmp/test_docker_restart.py \
+    gnmi/test_gnmi.py \
+    gnmi/test_gnmi_appldb.py \
+    gnmi/test_gnmi_countersdb.py \
+    snmp/test_snmp_default_route.py \
+    snmp/test_snmp_loopback.py \
     snmp/test_snmp_pfc_counters.py \
     snmp/test_snmp_queue.py \
-    snmp/test_snmp_loopback.py \
-    snmp/test_snmp_default_route.py \
-    tacacs/test_rw_user.py \
-    tacacs/test_ro_user.py \
-    tacacs/test_ro_disk.py \
-    tacacs/test_jit_user.py \
+    tacacs/test_accounting.py \
     tacacs/test_authorization.py \
-    tacacs/test_accounting.py"
+    tacacs/test_jit_user.py \
+    tacacs/test_ro_disk.py \
+    tacacs/test_ro_user.py \
+    tacacs/test_rw_user.py"
 
     pushd $SONIC_MGMT_DIR/tests
-    # TODO: Remove disable of loganaler and sanity check once multi-asic testbed is stable.
-    ./run_tests.sh $RUNTEST_CLI_COMMON_OPTS -c "$tests" -p logs/$tgname -e --disable_loganalyzer -e --skip_sanity -u
+    ./run_tests.sh $MULTI_ASIC_CLI_OPTIONS -c "$tests" -p logs/$tgname
+    popd
+}
+
+test_multi_asic_t1_lag_pr() {
+    tgname=multi_asic_t1_lag
+    tests="\
+    bgp/test_bgp_fact.py \
+    bmp/test_bmp_configdb.py \
+    bmp/test_bmp_redis_instance.py \
+    bmp/test_bmp_statedb.py \
+    bmp/test_docker_restart.py \
+    snmp/test_snmp_default_route.py \
+    snmp/test_snmp_loopback.py \
+    snmp/test_snmp_pfc_counters.py \
+    snmp/test_snmp_queue.py \
+    tacacs/test_accounting.py \
+    tacacs/test_authorization.py \
+    tacacs/test_jit_user.py \
+    tacacs/test_ro_user.py \
+    tacacs/test_rw_user.py"
+
+    pushd $SONIC_MGMT_DIR/tests
+    ./run_tests.sh $RUNTEST_CLI_COMMON_OPTS -c "$tests" -p logs/$tgname
+    popd
+}
+
+test_dualtor(){
+    tgname=dualtor
+    tests="arp/test_arp_extended.py"
+#    dualtor/test_ipinip.py \
+#    dualtor/test_orch_stress.py \
+#    dualtor/test_orchagent_active_tor_downstream.py \
+#    dualtor/test_orchagent_mac_move.py \
+#    dualtor/test_orchagent_slb.py \
+#    dualtor/test_orchagent_standby_tor_downstream.py \
+#    dualtor/test_server_failure.py \
+#    dualtor/test_standby_tor_upstream_mux_toggle.py \
+#    dualtor/test_toggle_mux.py \
+#    dualtor/test_tor_ecn.py \
+#    dualtor/test_tunnel_memory_leak.py "
+#    dualtor_io/test_heartbeat_failure.py \
+#    dualtor_io/test_link_drop.py \
+#    dualtor_io/test_link_failure.py \
+#    dualtor_io/test_normal_op.py \
+#    dualtor_io/test_tor_bgp_failure.py \
+#    dualtor_io/test_tor_failure.py"
+
+    pushd $SONIC_MGMT_DIR/tests
+    ./run_tests.sh $RUNTEST_CLI_COMMON_OPTS -c "$tests" -p logs/$tgname -e --disable_loganalyzer
     popd
 }
 
@@ -280,8 +381,10 @@ popd
 
 export ANSIBLE_LIBRARY=$SONIC_MGMT_DIR/ansible/library/
 
-# workaround for issue https://github.com/Azure/sonic-mgmt/issues/1659
+# workaround for issue https://github.com/sonic-net/sonic-mgmt/issues/1659
 export ANSIBLE_KEEP_REMOTE_FILES=1
+export GIT_USER_NAME=$GIT_USER_NAME
+export GIT_API_TOKEN=$GIT_API_TOKEN
 
 # clear logs from previous test runs
 rm -rf $SONIC_MGMT_DIR/tests/logs
@@ -296,8 +399,12 @@ elif [ x$test_suite == x"t1-lag" ]; then
     test_t1_lag
 elif [ x$test_suite == x"multi-asic-t1-lag" ]; then
     test_multi_asic_t1_lag
+elif [ x$test_suite == x"multi-asic-t1-lag-pr" ]; then
+    test_multi_asic_t1_lag_pr
 elif [ x$test_suite == x"t2" ]; then
     test_t2
+elif [ x$test_suite == x"dualtor" ]; then
+    test_dualtor
 else
     echo "unknown $test_suite"
     exit 1
