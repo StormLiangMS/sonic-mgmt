@@ -29,6 +29,9 @@ STATE_DB_KEY_IP = 'ip'
 
 DHCP_SERVER_CONFIG_TOOL_GCU = 'gcu'
 DHCP_SERVER_CONFIG_TOOL_CLI = 'cli'
+DHCP_SERVER_CONTAINER_NAME = "dhcp_server"
+DHCP_SERVER_IPV4_PROCESS_NAME = "dhcp-server-ipv4:kea-dhcp4"
+DHCP_REQUEST_OPTION_DEFAULT = object()
 DHCP_SERVER_SUPPORTED_OPTION_ID = (
     "147", "148", "149", "163", "164", "165", "166", "167", "168", "169", "170", "171", "172", "173",
     "174", "178", "179", "180", "181", "182", "183", "184", "185", "186", "187", "188", "189", "190",
@@ -62,9 +65,11 @@ def ping_dut_refresh_fdb(ptfhost, interface):
 def clean_dhcp_server_config(duthost):
     keys = duthost.shell("sonic-db-cli CONFIG_DB KEYS DHCP_SERVER_IPV4*")
     clean_order = [
+        "DHCP_SERVER_IPV4_BINDING",
+        "DHCP_SERVER_IPV4_MATCH",
         "DHCP_SERVER_IPV4_CUSTOMIZED_OPTIONS",
-        "DHCP_SERVER_IPV4_RANGE",
         "DHCP_SERVER_IPV4_PORT",
+        "DHCP_SERVER_IPV4_RANGE",
         "DHCP_SERVER_IPV4"
     ]
     for key in clean_order:
@@ -73,20 +78,47 @@ def clean_dhcp_server_config(duthost):
                 duthost.shell("sonic-db-cli CONFIG_DB DEL '{}'".format(line))
 
 
+def is_dhcp_server_running(duthost):
+    result = duthost.shell(
+        "docker exec {} supervisorctl status {}".format(
+            DHCP_SERVER_CONTAINER_NAME,
+            DHCP_SERVER_IPV4_PROCESS_NAME
+        ),
+        module_ignore_errors=True
+    )
+    return "RUNNING" in result.get("stdout", "")
+
+
+def wait_dhcp_server_ready(duthost, timeout=120):
+    pytest_assert(
+        wait_until(timeout, 1, 1, is_dhcp_server_running, duthost),
+        "dhcp_server container is not ready"
+    )
+
+
 def verify_lease(duthost, dhcp_interface, client_mac, exp_ip, exp_lease_time):
     pytest_assert(
         wait_until(
             11,  # it's by design that there is a latency around 0~11 seconds for updating state db
             1,
             3,
-            lambda _dh, _di, _cm: len(_dh.shell(
+            lambda _dh, _di, _cm: len(
+                _dh.shell(
                     "sonic-db-cli STATE_DB KEYS 'DHCP_SERVER_IPV4_LEASE|{}|{}'".format(_di, _cm)
-                )['stdout']) > 0,
+                )['stdout_lines']
+            ) == 1,
             duthost,
             dhcp_interface,
             client_mac
         ),
         'state db doesnt have lease info for client {}'.format(client_mac)
+    )
+    lease_keys = duthost.shell(
+        "sonic-db-cli STATE_DB KEYS 'DHCP_SERVER_IPV4_LEASE|{}|{}'".format(dhcp_interface, client_mac)
+    )['stdout_lines']
+    pytest_assert(
+        len(lease_keys) == 1,
+        "Expected exactly one lease entry for client {} while got {}".format(client_mac, lease_keys)
     )
     lease_start = duthost.shell("sonic-db-cli STATE_DB HGET 'DHCP_SERVER_IPV4_LEASE|{}|{}' '{}'"
                                 .format(dhcp_interface, client_mac, STATE_DB_KEY_LEASE_START))['stdout']
@@ -142,7 +174,7 @@ def create_common_config_patch(vlan_name, gateway, net_mask, dut_ports, ip_range
     return ret_patch
 
 
-def empty_config_patch(customized_options=None):
+def empty_config_patch(customized_options=None, include_match=False):
     ret_empty_patch = [
         {
             "op": "add",
@@ -160,6 +192,19 @@ def empty_config_patch(customized_options=None):
             "value": {}
         }
     ]
+    if include_match:
+        ret_empty_patch += [
+            {
+                "op": "add",
+                "path": "/DHCP_SERVER_IPV4_MATCH",
+                "value": {}
+            },
+            {
+                "op": "add",
+                "path": "/DHCP_SERVER_IPV4_BINDING",
+                "value": {}
+            }
+        ]
     if customized_options:
         ret_empty_patch.insert(
             0,
@@ -192,17 +237,75 @@ def append_common_config_patch(
     config_patch += new_patch
 
 
-def generate_dhcp_interface_config_patch(vlan_name, gateway, net_mask, customized_options=None):
+def create_match_config_patch(vlan_name, gateway, net_mask, matches, bindings, ip_ranges=None, customized_options=None):
+    ret_patch = empty_config_patch(customized_options, include_match=True)
+    append_match_config_patch(
+        ret_patch,
+        vlan_name,
+        gateway,
+        net_mask,
+        matches,
+        bindings,
+        ip_ranges,
+        customized_options
+    )
+    return ret_patch
+
+
+def append_match_config_patch(
+    config_patch,
+    vlan_name,
+    gateway,
+    net_mask,
+    matches,
+    bindings,
+    ip_ranges=None,
+    customized_options=None,
+    mode="MATCH",
+    state="enabled",
+    lease_time=DHCP_DEFAULT_LEASE_TIME,
+    include_interface=True
+):
+    new_patch = []
+    if customized_options:
+        new_patch += generate_dhcp_custom_option_config_patch(customized_options)
+    if include_interface:
+        new_patch += generate_dhcp_interface_config_patch(
+            vlan_name,
+            gateway,
+            net_mask,
+            customized_options,
+            mode=mode,
+            state=state,
+            lease_time=lease_time
+        )
+    if ip_ranges:
+        range_names = sorted(ip_ranges.keys())
+        new_patch += generate_dhcp_range_config_patch([ip_ranges[name] for name in range_names], range_names)
+    new_patch += generate_dhcp_match_config_patch(matches)
+    new_patch += generate_dhcp_binding_config_patch(vlan_name, bindings)
+    config_patch += new_patch
+
+
+def generate_dhcp_interface_config_patch(
+    vlan_name,
+    gateway,
+    net_mask,
+    customized_options=None,
+    mode="PORT",
+    state="enabled",
+    lease_time=DHCP_DEFAULT_LEASE_TIME
+):
     ret_interface_config_patch = [
         {
             "op": "add",
             "path": "/DHCP_SERVER_IPV4/%s" % vlan_name,
             "value": {
                 "gateway": "%s" % gateway,
-                "lease_time": "%s" % DHCP_DEFAULT_LEASE_TIME,
-                "mode": "PORT",
+                "lease_time": "%s" % lease_time,
+                "mode": "%s" % mode,
                 "netmask": "%s" % net_mask,
-                "state": "enabled"
+                "state": "%s" % state
             }
         }
     ]
@@ -239,6 +342,39 @@ def generate_dhcp_port_config_patch(vlan_name, dut_ports, range_names):
     return ret_port_config_patch
 
 
+def generate_dhcp_match_config_patch(matches):
+    ret_match_config_patch = []
+    for match_name in sorted(matches.keys()):
+        ret_match_config_patch.append({
+            "op": "add",
+            "path": "/DHCP_SERVER_IPV4_MATCH/%s" % match_name,
+            "value": matches[match_name]
+        })
+    return ret_match_config_patch
+
+
+def generate_dhcp_binding_config_patch(vlan_name, bindings):
+    ret_binding_config_patch = []
+    for binding_name in sorted(bindings.keys()):
+        binding_value = bindings[binding_name]
+        pytest_require(binding_value.get("matches"), "Invalid binding {}, matches should not be empty".format(
+            binding_name
+        ))
+        pytest_require(
+            ("ips" in binding_value) ^ ("ranges" in binding_value),
+            "Invalid binding {}, exactly one of ips or ranges should be configured".format(binding_name)
+        )
+        ret_binding_config_patch.append({
+            "op": "add",
+            "path": "/DHCP_SERVER_IPV4_BINDING/%s|%s" % (vlan_name, binding_name),
+            "value": {
+                key: list(value) if isinstance(value, (list, tuple)) else value
+                for key, value in binding_value.items()
+            }
+        })
+    return ret_binding_config_patch
+
+
 def generate_dhcp_custom_option_config_patch(customized_options):
     ret_custom_option_config_patch = []
     for option_name, option_info in customized_options.items():
@@ -260,12 +396,55 @@ def generate_common_config_cli_commands(vlan_name, gateway, net_mask, dut_ports,
     return ret_commands
 
 
-def generate_dhcp_interface_config_cli_commands(vlan_name, gateway, net_mask):
-    return [
-        'config dhcp_server ipv4 add --mode PORT --lease_time %s ' % DHCP_DEFAULT_LEASE_TIME +
-        '--gateway %s --netmask %s %s' % (gateway, net_mask, vlan_name),
-        'config dhcp_server ipv4 enable %s' % vlan_name
+def generate_match_config_cli_commands(vlan_name, gateway, net_mask, matches, bindings, ip_ranges=None):
+    ret_commands = generate_dhcp_interface_config_cli_commands(
+        vlan_name,
+        gateway,
+        net_mask,
+        mode="MATCH",
+        enable_after_add=False
+    )
+    if ip_ranges:
+        for range_name in sorted(ip_ranges.keys()):
+            ret_commands += generate_dhcp_range_config_cli_commands(ip_ranges[range_name], range_name)
+    for match_name in sorted(matches.keys()):
+        ret_commands += generate_dhcp_match_config_cli_commands(
+            match_name,
+            matches[match_name]["type"],
+            matches[match_name]["value"]
+        )
+    for binding_name in sorted(bindings.keys()):
+        ret_commands += generate_dhcp_binding_config_cli_commands(
+            vlan_name,
+            binding_name,
+            bindings[binding_name]["matches"],
+            bindings[binding_name].get("ips"),
+            bindings[binding_name].get("ranges")
+        )
+    ret_commands.append('config dhcp_server ipv4 enable %s' % vlan_name)
+    return ret_commands
+
+
+def generate_dhcp_interface_config_cli_commands(
+    vlan_name,
+    gateway,
+    net_mask,
+    mode="PORT",
+    enable_after_add=True,
+    lease_time=DHCP_DEFAULT_LEASE_TIME
+):
+    ret_commands = [
+        'config dhcp_server ipv4 add --mode {} --lease_time {} --gateway {} --netmask {} {}'.format(
+            mode,
+            lease_time,
+            gateway,
+            net_mask,
+            vlan_name
+        )
     ]
+    if enable_after_add:
+        ret_commands.append('config dhcp_server ipv4 enable %s' % vlan_name)
+    return ret_commands
 
 
 def generate_dhcp_range_config_cli_commands(ip_range, range_name="test_single_ip"):
@@ -285,6 +464,27 @@ def generate_dhcp_port_config_cli_commands(vlan_name, dut_port, range_name="test
     ]
 
 
+def generate_dhcp_match_config_cli_commands(match_name, match_type, match_value):
+    return [
+        'config dhcp_server ipv4 match add %s --type %s --value %s' % (
+            match_name,
+            match_type,
+            match_value
+        )
+    ]
+
+
+def generate_dhcp_binding_config_cli_commands(vlan_name, binding_name, matches, ips=None, ranges=None):
+    pytest_require(bool(ips) ^ bool(ranges), "Exactly one of ips or ranges should be configured")
+    command = 'config dhcp_server ipv4 binding add %s %s' % (vlan_name, binding_name)
+    if ips:
+        command += ' %s' % ",".join(ips)
+    command += ' --match %s' % ",".join(matches)
+    if ranges:
+        command += ' --range %s' % ",".join(ranges)
+    return [command]
+
+
 def match_expected_dhcp_options(pkt_dhcp_options, option_id, expected_value):
     for option in pkt_dhcp_options:
         if option[0] == option_id:
@@ -296,10 +496,19 @@ def convert_mac_to_chaddr(mac):
     return binascii.unhexlify(mac.replace(":", "")) + b'\x00' * 10
 
 
-def create_dhcp_client_packet(src_mac, message_type, client_options=[], xid=123, ciaddr='0.0.0.0'):
+def create_dhcp_client_packet(
+    src_mac,
+    message_type,
+    client_options=[],
+    xid=123,
+    ciaddr='0.0.0.0',
+    src_ip=DHCP_IP_DEFAULT_ROUTE,
+    dst_ip=DHCP_IP_BROADCAST,
+    dst_mac=DHCP_MAC_BROADCAST
+):
     dhcp_options = [("message-type", message_type)] + client_options + ["end"]
-    pkt = scapy.Ether(dst=DHCP_MAC_BROADCAST, src=src_mac)
-    pkt /= scapy.IP(src=DHCP_IP_DEFAULT_ROUTE, dst=DHCP_IP_BROADCAST)
+    pkt = scapy.Ether(dst=dst_mac, src=src_mac)
+    pkt /= scapy.IP(src=src_ip, dst=dst_ip)
     pkt /= scapy.UDP(sport=DHCP_UDP_CLIENT_PORT, dport=DHCP_UDP_SERVER_PORT)
     pkt /= scapy.BOOTP(chaddr=convert_mac_to_chaddr(src_mac), xid=xid, ciaddr=ciaddr)
     pkt /= scapy.DHCP(options=dhcp_options)
@@ -342,14 +551,13 @@ def validate_dhcp_server_pkts(
     exp_net_mask,
     exp_gateway,
     exp_lease_time=DHCP_DEFAULT_LEASE_TIME,
-    options=None
+    options=None,
+    exp_server_id=None
 ):
     def is_expected_pkt(pkt):
         logging.info("validate_dhcp_server_pkts: %s" % repr(pkt))
         pkt_dhcp_options = pkt[scapy.DHCP].options
-        if pkt[scapy.BOOTP].xid != test_xid:
-            return False
-        elif pkt[scapy.BOOTP].yiaddr != expected_ip:
+        if pkt[scapy.BOOTP].yiaddr != expected_ip:
             return False
         elif not match_expected_dhcp_options(pkt_dhcp_options, "subnet_mask", exp_net_mask):
             return False
@@ -357,16 +565,27 @@ def validate_dhcp_server_pkts(
             return False
         elif not match_expected_dhcp_options(pkt_dhcp_options, "lease_time", exp_lease_time):
             return False
-        elif not match_expected_dhcp_options(pkt_dhcp_options, "message-type", exp_msg_type):
+        elif exp_server_id is not None and not match_expected_dhcp_options(pkt_dhcp_options, "server_id", exp_server_id):
             return False
         elif options:
-            pkt_dhcp_options = pkt[scapy.DHCP].options
             for option_id, expected_value in options.items():
                 if not match_expected_dhcp_options(pkt_dhcp_options, int(option_id), expected_value):
                     return False
         return True
-    pytest_assert(len([pkt for pkt in pkts if is_expected_pkt(pkt)]) == 1,
-                  "Didn't got dhcp packet with expected ip and xid")
+    exp_pkts = [
+        pkt for pkt in pkts
+        if pkt[scapy.BOOTP].xid == test_xid
+        if match_expected_dhcp_options(pkt[scapy.DHCP].options, "message-type", exp_msg_type)
+    ]
+    pytest_assert(
+        len(exp_pkts) == 1,
+        "Expected exactly one dhcp packet for xid={} and message_type={}, got {}".format(
+            test_xid,
+            exp_msg_type,
+            len(exp_pkts)
+        )
+    )
+    pytest_assert(is_expected_pkt(exp_pkts[0]), "Got dhcp packet with unexpected ip or option values")
 
 
 def validate_no_dhcp_server_pkts(pkts, test_xid):
@@ -412,9 +631,21 @@ def verify_discover_and_request_then_release(
         refresh_fdb_ptf_port=None,
         exp_lease_time=DHCP_DEFAULT_LEASE_TIME,
         release_needed=True,
-        customized_options=None
+        customized_options=None,
+        client_mac=None,
+        discover_client_options=None,
+        request_client_options=None,
+        request_requested_ip=DHCP_REQUEST_OPTION_DEFAULT,
+        request_expected_assigned_ip=DHCP_REQUEST_OPTION_DEFAULT
 ):
-    client_mac = ptfadapter.dataplane.get_mac(0, ptf_mac_port_index).decode('utf-8')
+    if request_requested_ip is DHCP_REQUEST_OPTION_DEFAULT:
+        request_requested_ip = expected_assigned_ip
+    if request_expected_assigned_ip is DHCP_REQUEST_OPTION_DEFAULT:
+        request_expected_assigned_ip = expected_assigned_ip
+    if not client_mac:
+        client_mac = ptfadapter.dataplane.get_mac(0, ptf_mac_port_index).decode('utf-8')
+    discover_client_options = discover_client_options or []
+    request_client_options = request_client_options or []
     pkts_validator = validate_dhcp_server_pkts if expected_assigned_ip else validate_no_dhcp_server_pkts
     pkts_validator_args = [
         test_xid,
@@ -423,12 +654,13 @@ def verify_discover_and_request_then_release(
         net_mask,
         exp_gateway,
         exp_lease_time,
-        customized_options
+        customized_options,
+        server_id
     ] if expected_assigned_ip else [test_xid]
     discover_pkt = create_dhcp_client_packet(
         src_mac=client_mac,
         message_type=DHCP_MESSAGE_TYPE_DISCOVER_NUM,
-        client_options=[],
+        client_options=discover_client_options,
         xid=test_xid
     )
     send_and_verify(
@@ -442,22 +674,28 @@ def verify_discover_and_request_then_release(
         pkts_validator_args=pkts_validator_args,
         refresh_fdb_ptf_port=refresh_fdb_ptf_port
     )
+    request_options = list(request_client_options)
+    if request_requested_ip is not None:
+        request_options = [
+            ("requested_addr", request_requested_ip),
+            ("server_id", server_id)
+        ] + request_options
     request_pkt = create_dhcp_client_packet(
         src_mac=client_mac,
         message_type=DHCP_MESSAGE_TYPE_REQUEST_NUM,
-        client_options=[
-            ("requested_addr", expected_assigned_ip),
-            ("server_id", server_id)
-        ],
+        client_options=request_options,
         xid=test_xid
     )
+    pkts_validator = validate_dhcp_server_pkts if request_expected_assigned_ip else validate_no_dhcp_server_pkts
     pkts_validator_args = [
         test_xid,
-        expected_assigned_ip,
+        request_expected_assigned_ip,
         DHCP_MESSAGE_TYPE_ACK_NUM,
         net_mask, exp_gateway,
-        exp_lease_time
-    ] if expected_assigned_ip else [test_xid]
+        exp_lease_time,
+        None,
+        server_id
+    ] if request_expected_assigned_ip else [test_xid]
     send_and_verify(
         duthost=duthost,
         ptfhost=ptfhost,
@@ -469,9 +707,18 @@ def verify_discover_and_request_then_release(
         pkts_validator_args=pkts_validator_args,
         refresh_fdb_ptf_port=refresh_fdb_ptf_port
     )
-    if expected_assigned_ip and release_needed:
-        verify_lease(duthost, dhcp_interface, client_mac, expected_assigned_ip, exp_lease_time)
-        send_release_packet(ptfadapter, ptf_port_index, test_xid, client_mac, expected_assigned_ip, server_id)
+    if request_expected_assigned_ip:
+        verify_lease(duthost, dhcp_interface, client_mac, request_expected_assigned_ip, exp_lease_time)
+        if release_needed:
+            send_release_packet(
+                ptfadapter,
+                ptf_port_index,
+                test_xid,
+                client_mac,
+                request_expected_assigned_ip,
+                server_id
+            )
+    return client_mac
 
 
 def send_release_packet(
