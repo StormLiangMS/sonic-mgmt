@@ -1,3 +1,4 @@
+import contextlib
 import ipaddress
 import logging
 
@@ -7,11 +8,13 @@ from tests.common import config_reload
 from tests.common.dhcp_relay_utils import enable_sonic_dhcpv4_relay_agent, wait_dhcp_relay_ready  # noqa: F401
 from tests.common.fixtures.split_vlan import apply_config_patch, generate_sub_vlans_config_patch
 from tests.common.helpers.assertions import pytest_assert, pytest_require
+from tests.common.utilities import wait_until
 from dhcp_server_test_common import DHCP_DEFAULT_LEASE_TIME, DHCP_MESSAGE_TYPE_ACK_NUM, \
     DHCP_MESSAGE_TYPE_DISCOVER_NUM, DHCP_MESSAGE_TYPE_REQUEST_NUM, DHCP_SERVER_CONFIG_TOOL_CLI, \
     DHCP_SERVER_CONFIG_TOOL_GCU, append_common_config_patch, append_match_config_patch, \
     apply_dhcp_server_config_gcu, clean_dhcp_server_config, create_dhcp_client_packet, create_match_config_patch, \
-    dhcp_server_config, empty_config_patch, generate_match_config_cli_commands, send_and_verify, \
+    dhcp_server_config as base_dhcp_server_config, empty_config_patch, generate_match_config_cli_commands, \
+    send_and_verify, \
     send_release_packet, validate_dhcp_server_pkts, validate_no_dhcp_server_pkts, \
     verify_discover_and_request_then_release, verify_lease, wait_dhcp_server_ready
 
@@ -23,6 +26,8 @@ pytestmark = [
 
 
 DEFAULT_REQUEST_EXPECTED_IP = object()
+DHCP_SERVER_CONFIG_SETTLE_TIME = 3
+DHCP_LEASE_STATE_TIMEOUT = 11
 
 
 def _build_option60_option(value):
@@ -90,14 +95,50 @@ def _select_client_mac_ptf_ports(vlan_context, send_ptf_port_index, count):
     return mac_ptf_port_indices[:count]
 
 
-def _assert_no_lease(duthost, vlan_name, client_mac):
-    lease_keys = duthost.shell(
+def _get_lease_keys(duthost, vlan_name, client_mac):
+    return duthost.shell(
         "sonic-db-cli STATE_DB KEYS 'DHCP_SERVER_IPV4_LEASE|{}|{}'".format(vlan_name, client_mac)
     )['stdout_lines']
+
+
+def _assert_no_lease(duthost, vlan_name, client_mac):
+    observed_lease = {'keys': []}
+
+    def lease_exists():
+        observed_lease['keys'] = _get_lease_keys(duthost, vlan_name, client_mac)
+        return bool(observed_lease['keys'])
+
     pytest_assert(
-        not lease_keys,
-        'Unexpected lease entry for client {} on {}: {}'.format(client_mac, vlan_name, lease_keys)
+        not wait_until(DHCP_LEASE_STATE_TIMEOUT, 1, 3, lease_exists),
+        'Unexpected lease entry for client {} on {}: {}'.format(
+            client_mac,
+            vlan_name,
+            observed_lease['keys']
+        )
     )
+
+
+def _wait_lease_absent(duthost, vlan_name, client_mac):
+    pytest_assert(
+        wait_until(
+            DHCP_LEASE_STATE_TIMEOUT,
+            1,
+            1,
+            lambda: not _get_lease_keys(duthost, vlan_name, client_mac)
+        ),
+        'Lease entry for client {} on {} was not released'.format(client_mac, vlan_name)
+    )
+
+
+def _wait_dhcp_server_config_applied(duthost):
+    wait_dhcp_server_ready(duthost, initial_delay=DHCP_SERVER_CONFIG_SETTLE_TIME)
+
+
+@contextlib.contextmanager
+def dhcp_server_config(duthost, config_tool, config_to_apply):
+    with base_dhcp_server_config(duthost, config_tool, config_to_apply):
+        _wait_dhcp_server_config_applied(duthost)
+        yield
 
 
 def _restart_dhcp_server_container(duthost):
@@ -531,7 +572,7 @@ def test_dhcp_server_match_or_same_pool(
             bindings
         )
     ):
-        _verify_client_assignment(
+        first_client_mac = _verify_client_assignment(
             duthost,
             ptfhost,
             ptfadapter,
@@ -543,6 +584,7 @@ def test_dhcp_server_match_or_same_pool(
             shared_ip,
             option60_value='MAIA-A'
         )
+        _wait_lease_absent(duthost, vlan_context['vlan_name'], first_client_mac)
         _verify_client_assignment(
             duthost,
             ptfhost,
@@ -611,6 +653,7 @@ def test_dhcp_server_match_dynamic_match_update(
                 'value': 'MAIA-B'
             }]
         )
+        _wait_dhcp_server_config_applied(duthost)
         old_client_mac = _verify_client_assignment(
             duthost,
             ptfhost,
@@ -696,6 +739,7 @@ def test_dhcp_server_match_dynamic_binding_update(
                 }
             }]
         )
+        _wait_dhcp_server_config_applied(duthost)
         container_id_after = duthost.shell("docker inspect -f '{{.Id}}' dhcp_server")['stdout']
         pytest_assert(
             container_id_before == container_id_after,
@@ -777,6 +821,7 @@ def test_dhcp_server_match_mode_switch(
                 'value': 'MATCH'
             }]
         )
+        _wait_dhcp_server_config_applied(duthost)
         _verify_client_assignment(
             duthost,
             ptfhost,
@@ -797,6 +842,7 @@ def test_dhcp_server_match_mode_switch(
                 'value': 'PORT'
             }]
         )
+        _wait_dhcp_server_config_applied(duthost)
         _verify_client_assignment(
             duthost,
             ptfhost,
@@ -872,6 +918,7 @@ def test_dhcp_server_match_existing_lease_mode_switch(
                     'value': 'MATCH'
                 }]
             )
+            _wait_dhcp_server_config_applied(duthost)
             request_pkt = create_dhcp_client_packet(
                 src_mac=client_mac,
                 message_type=DHCP_MESSAGE_TYPE_REQUEST_NUM,

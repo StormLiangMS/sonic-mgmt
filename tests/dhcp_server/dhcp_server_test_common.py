@@ -89,9 +89,9 @@ def is_dhcp_server_running(duthost):
     return "RUNNING" in result.get("stdout", "")
 
 
-def wait_dhcp_server_ready(duthost, timeout=120):
+def wait_dhcp_server_ready(duthost, timeout=120, initial_delay=1):
     pytest_assert(
-        wait_until(timeout, 1, 1, is_dhcp_server_running, duthost),
+        wait_until(timeout, 1, initial_delay, is_dhcp_server_running, duthost),
         "dhcp_server container is not ready"
     )
 
@@ -136,14 +136,15 @@ def verify_lease(duthost, dhcp_interface, client_mac, exp_ip, exp_lease_time):
 @contextlib.contextmanager
 def dhcp_server_config(duthost, config_tool, config_to_apply):
     clean_dhcp_server_config(duthost)
-    if config_tool == DHCP_SERVER_CONFIG_TOOL_GCU:
-        apply_dhcp_server_config_gcu(duthost, config_to_apply)
-    elif config_tool == DHCP_SERVER_CONFIG_TOOL_CLI:
-        apply_dhcp_server_config_cli(duthost, config_to_apply)
+    try:
+        if config_tool == DHCP_SERVER_CONFIG_TOOL_GCU:
+            apply_dhcp_server_config_gcu(duthost, config_to_apply)
+        elif config_tool == DHCP_SERVER_CONFIG_TOOL_CLI:
+            apply_dhcp_server_config_cli(duthost, config_to_apply)
 
-    yield
-
-    clean_dhcp_server_config(duthost)
+        yield
+    finally:
+        clean_dhcp_server_config(duthost)
 
 
 def apply_dhcp_server_config_cli(duthost, config_commands):
